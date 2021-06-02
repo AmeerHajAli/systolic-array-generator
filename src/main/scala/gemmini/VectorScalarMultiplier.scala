@@ -87,7 +87,7 @@ class VectorScalarMultiplier[T <: Data, U <: Data, Tag <: Data](
       new VectorScalarMultiplierResp(block_cols, t, tag_t),
       latency
     )())
-    io.resp <> pipe.io.out
+    io.resp <> Queue(pipe.io.out)
     in_fire := pipe.io.in.fire()
 
     pipe.io.in.valid := in.valid
@@ -120,7 +120,7 @@ class VectorScalarMultiplier[T <: Data, U <: Data, Tag <: Data](
       head_oh := (head_oh << 1) | head_oh(nEntries-1)
     }
     in_fire := (in.valid &&
-      (!Mux1H(tail_oh.asBools, regs.map(_.valid)) || (tail_oh === head_oh && io.resp.fire()))
+      (!Mux1H(tail_oh.asBools, regs.map(_.valid)))
     )
     when (in_fire) {
       for (i <- 0 until nEntries) {

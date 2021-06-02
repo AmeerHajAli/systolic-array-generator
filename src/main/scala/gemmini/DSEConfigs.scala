@@ -27,6 +27,7 @@ object DSEBaseConfig {
     sp_banks = 4, // TODO support one-bank designs
     acc_banks = 1,
     acc_singleported = false,
+    acc_latency = 2,
     num_acc_sub_banks = -1,
     sp_capacity = CapacityInKilobytes(64),
     sp_singleported = false,
@@ -60,6 +61,7 @@ object DSEBaseConfig {
     acc_read_full_width = true,
     acc_read_small_width = true,
     use_dedicated_tl_port = false,
+    use_shared_ext_mem = true,
     pe_latency = 0,
 
     ex_read_from_spad = true,
@@ -74,6 +76,7 @@ object DSEBaseConfig {
     max_in_flight_reqs = 16,
 
     mesh_output_delay = 1,
+    clock_gate = false
   )
 }
 

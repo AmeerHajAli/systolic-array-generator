@@ -30,6 +30,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              sp_capacity: GemminiMemCapacity,
                                                                              acc_banks: Int,
                                                                              acc_singleported: Boolean,
+                                                                             acc_latency: Int,
                                                                              num_acc_sub_banks: Int,
                                                                              acc_capacity: GemminiMemCapacity,
                                                                              shifter_banks: Int,
@@ -50,7 +51,8 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
                                                                              acc_read_full_width: Boolean,
                                                                              acc_read_small_width: Boolean,
                                                                              use_dedicated_tl_port: Boolean,
-                                                                             // enable_a_transpose: Boolean,
+                                                                             use_shared_ext_mem: Boolean,
+                                                                            // enable_a_transpose: Boolean,
                                                                              // enable_b_transpose: Boolean,
 
                                                                              tlb_size: Int,
@@ -66,6 +68,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
 
                                                                              mesh_output_delay: Int,
 
+                                                                             clock_gate: Boolean,
                                                                              headerFileName: String = "gemmini_params.h"
                                                        ) {
   val sp_width = meshColumns * tileColumns * inputType.getWidth
@@ -208,7 +211,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
           (dt.expWidth, dt.sigWidth) match {
             case (8, 24) => (scala.Float.MinValue.toString, scala.Float.MaxValue.toString)
             case (11, 53) => (scala.Double.MinValue.toString, scala.Double.MaxValue.toString)
-            case _ => (((Range(-1,-(dt.sigWidth),-1).map(-Math.pow(2, _)).foldLeft(-1.0)(_ + _)) * Math.pow(2, Math.pow(2, dt.expWidth - 1) - 1)).toString, ((Range(-1,-(dt.sigWidth),-1).map(Math.pow(2, _)).foldLeft(1.0)(_ + _)) * Math.pow(2, Math.pow(2, dt.expWidth - 1) - 1)).toString)
+            case (e, s) => (((Range(-1,-(s),-1).map(-Math.pow(2, _)).foldLeft(-1.0)(_ + _)) * Math.pow(2, Math.pow(2, e - 1) - 1)).toString, ((Range(-1,-(s),-1).map(Math.pow(2, _)).foldLeft(1.0)(_ + _)) * Math.pow(2, Math.pow(2, e - 1) - 1)).toString)
           }
         case _ => throw new IllegalArgumentException(s"Data type $dataType is unknown")
       }
@@ -222,7 +225,7 @@ case class GemminiArrayConfig[T <: Data : Arithmetic, U <: Data, V <: Data](
           (dt.expWidth, dt.sigWidth) match {
             case (8, 24) => "float"
             case (11, 53) => "double"
-            case _ => s"uint" + (Math.pow(2, Math.ceil(Math.log(dt.expWidth + dt.sigWidth)/Math.log(2.0)))).toInt.toString + s"_t"
+            case (e, s) => s"uint" + (Math.pow(2, Math.ceil(Math.log(e + s)/Math.log(2.0)))).toInt.toString + s"_t"
           }
         case _ => throw new IllegalArgumentException(s"Data type $dataType is unknown")
       }

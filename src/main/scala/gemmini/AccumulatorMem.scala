@@ -44,17 +44,60 @@ class AccumulatorWriteReq[T <: Data: Arithmetic](n: Int, t: Vec[Vec[T]]) extends
   override def cloneType: this.type = new AccumulatorWriteReq(n, t).asInstanceOf[this.type]
 }
 
-class AccumulatorMemIO [T <: Data: Arithmetic, U <: Data](n: Int, t: Vec[Vec[T]], scale_t: U) extends Bundle {
+
+class AccumulatorMemIO [T <: Data: Arithmetic, U <: Data](n: Int, t: Vec[Vec[T]], scale_t: U,
+  num_acc_sub_banks: Int, use_shared_ext_mem: Boolean
+) extends Bundle {
   val read = Flipped(new AccumulatorReadIO(n, log2Ceil(t.head.head.getWidth), t, scale_t))
   // val write = Flipped(new AccumulatorWriteIO(n, t))
   val write = Flipped(Decoupled(new AccumulatorWriteReq(n, t)))
 
-  override def cloneType: this.type = new AccumulatorMemIO(n, t, scale_t).asInstanceOf[this.type]
+  val ext_mem = if (use_shared_ext_mem) Some(Vec(num_acc_sub_banks, new ExtMemIO)) else None
+
+  val acc = new Bundle {
+    val valid = Output(Bool())
+    val ina = Output(t.cloneType)
+    val inb = Output(t.cloneType)
+    val out = Input(t.cloneType)
+  }
+
+  override def cloneType: this.type = new AccumulatorMemIO(n, t, scale_t, num_acc_sub_banks, use_shared_ext_mem).asInstanceOf[this.type]
+}
+
+class AccPipe[T <: Data : Arithmetic](latency: Int, t: T)(implicit ev: Arithmetic[T]) extends Module {
+  val io = IO(new Bundle {
+    val ina = Input(t.cloneType)
+    val inb = Input(t.cloneType)
+    val out = Output(t.cloneType)
+  })
+  import ev._
+  io.out := ShiftRegister(io.ina + io.inb, latency)
+}
+
+class AccPipeShared[T <: Data : Arithmetic](latency: Int, t: Vec[Vec[T]], banks: Int) extends Module {
+  val io = IO(new Bundle {
+    val in_sel = Input(Vec(banks, Bool()))
+    val ina = Input(Vec(banks, t.cloneType))
+    val inb = Input(Vec(banks, t.cloneType))
+    val out = Output(t.cloneType)
+  })
+  val ina = Mux1H(io.in_sel, io.ina)
+  val inb = Mux1H(io.in_sel, io.inb)
+  io.out := VecInit((ina zip inb).map { case (rv, wv) =>
+    VecInit((rv zip wv).map { case (re, we) =>
+      val m = Module(new AccPipe(latency, t.head.head.cloneType))
+      m.io.ina := re
+      m.io.inb := we
+      m.io.out
+    })
+  })
 }
 
 class AccumulatorMem[T <: Data, U <: Data](
   n: Int, t: Vec[Vec[T]], scale_args: ScaleArguments[T, U],
-  acc_singleported: Boolean, num_acc_sub_banks: Int
+  acc_singleported: Boolean, num_acc_sub_banks: Int,
+  use_shared_ext_mem: Boolean,
+  acc_latency: Int, acc_type: T
 )
   (implicit ev: Arithmetic[T]) extends Module {
   // TODO Do writes in this module work with matrices of size 2? If we try to read from an address right after writing
@@ -69,38 +112,45 @@ class AccumulatorMem[T <: Data, U <: Data](
   import ev._
 
   // TODO unify this with TwoPortSyncMemIO
-  val io = IO(new AccumulatorMemIO(n, t, scale_args.multiplicand_t))
+  val io = IO(new AccumulatorMemIO(n, t, scale_args.multiplicand_t, num_acc_sub_banks, use_shared_ext_mem))
 
+  require (acc_latency >= 2)
 
-  // For any write operation, we spend 2 cycles reading the existing address out, buffering it in a register, and then
-  // accumulating on top of it (if necessary)
-  val wdata_buf = ShiftRegister(io.write.bits.data, 2)
-  val waddr_buf = ShiftRegister(io.write.bits.addr, 2)
-  val acc_buf = ShiftRegister(io.write.bits.acc, 2)
-  val mask_buf = ShiftRegister(io.write.bits.mask, 2)
-  val w_buf_valid = ShiftRegister(io.write.fire(), 2)
+  val pipe_regs = Reg(Vec(acc_latency, Valid(new AccumulatorWriteReq(n, t))))
+  val pipe_out = pipe_regs(acc_latency-1)
+  pipe_regs(0).valid := io.write.fire()
+  pipe_regs(0).bits  := io.write.bits
+  for (i <- 1 until acc_latency) {
+    pipe_regs(i) := pipe_regs(i-1)
+  }
+  for (i <- 0 until acc_latency) {
+    when (reset.asBool) { pipe_regs(i).valid := false.B }
+  }
+
   val acc_rdata = Wire(t)
   acc_rdata := DontCare
   val read_rdata = Wire(t)
   read_rdata := DontCare
   val block_read_req = WireInit(false.B)
-  val w_sum = VecInit((RegNext(acc_rdata) zip wdata_buf).map { case (rv, wv) =>
-    VecInit((rv zip wv).map(t => t._1 + t._2))
-  })
+  val pipe_out_acc_data = io.acc.out
+  io.acc.valid := pipe_regs(0).valid && pipe_regs(0).bits.acc
+  io.acc.ina := acc_rdata
+  io.acc.inb := pipe_regs(0).bits.data
 
+  val mask_len = t.getWidth / 8
+  val mask_elem = UInt((t.getWidth / mask_len).W)
   if (!acc_singleported) {
-    val mem = TwoPortSyncMem(n, t, t.getWidth / 8) // TODO We assume byte-alignment here. Use aligned_to instead
-    mem.io.waddr := waddr_buf
-    mem.io.wen := w_buf_valid
-    mem.io.wdata := Mux(acc_buf, w_sum, wdata_buf)
-    mem.io.mask := mask_buf
+    require(!use_shared_ext_mem)
+    val mem = TwoPortSyncMem(n, t, mask_len) // TODO We assume byte-alignment here. Use aligned_to instead
+    mem.io.waddr := pipe_out.bits.addr
+    mem.io.wen := pipe_out.valid
+    mem.io.wdata := Mux(pipe_out.bits.acc, pipe_out_acc_data, pipe_out.bits.data)
+    mem.io.mask := pipe_out.bits.mask
     acc_rdata := mem.io.rdata
     read_rdata := mem.io.rdata
     mem.io.raddr := Mux(io.write.fire() && io.write.bits.acc, io.write.bits.addr, io.read.req.bits.addr)
     mem.io.ren := io.read.req.fire() || (io.write.fire() && io.write.bits.acc)
   } else {
-    val mask_len = t.getWidth / 8
-    val mask_elem = UInt((t.getWidth / mask_len).W)
     val reads = Wire(Vec(2, Decoupled(UInt())))
     reads(0).valid := io.write.valid && io.write.bits.acc
     reads(0).bits  := io.write.bits.addr
@@ -112,7 +162,29 @@ class AccumulatorMem[T <: Data, U <: Data](
     for (i <- 0 until num_acc_sub_banks) {
       def isThisBank(addr: UInt) = addr(log2Ceil(num_acc_sub_banks)-1,0) === i.U
       def getBankIdx(addr: UInt) = addr >> log2Ceil(num_acc_sub_banks)
-      val mem = SyncReadMem(n / num_acc_sub_banks, Vec(mask_len, mask_elem))
+      val (read, write) = if (use_shared_ext_mem) {
+        def read(addr: UInt, ren: Bool): Data = {
+          io.ext_mem.get(i).read_en := ren
+          io.ext_mem.get(i).read_addr := addr
+          io.ext_mem.get(i).read_data
+        }
+        io.ext_mem.get(i).write_en := false.B
+        io.ext_mem.get(i).write_addr := DontCare
+        io.ext_mem.get(i).write_data := DontCare
+        io.ext_mem.get(i).write_mask := DontCare
+        def write(addr: UInt, wdata: Vec[UInt], wmask: Vec[Bool]) = {
+          io.ext_mem.get(i).write_en := true.B
+          io.ext_mem.get(i).write_addr := addr
+          io.ext_mem.get(i).write_data := wdata.asUInt
+          io.ext_mem.get(i).write_mask := wmask.asUInt
+        }
+        (read _, write _)
+      } else {
+        val mem = SyncReadMem(n / num_acc_sub_banks, Vec(mask_len, mask_elem))
+        def read(addr: UInt, ren: Bool): Data = mem.read(addr, ren)
+        def write(addr: UInt, wdata: Vec[UInt], wmask: Vec[Bool]) = mem.write(addr, wdata, wmask)
+        (read _, write _)
+      }
 
       val ren = WireInit(false.B)
       val raddr = WireInit(getBankIdx(reads(0).bits))
@@ -157,27 +229,27 @@ class AccumulatorMem[T <: Data, U <: Data](
         }
       }
 
-      when (w_buf_valid && isThisBank(waddr_buf)) {
+      when (pipe_out.valid && isThisBank(pipe_out.bits.addr)) {
         assert(!((w_q_tail.asBools zip w_q.map(_.valid)).map({ case (h,v) => h && v }).reduce(_||_)))
         w_q_tail := w_q_tail << 1 | w_q_tail(nEntries-1)
         for (i <- 0 until nEntries) {
           when (w_q_tail(i)) {
             w_q(i).valid := true.B
-            w_q(i).data  := Mux(acc_buf, w_sum, wdata_buf).asTypeOf(Vec(mask_len, mask_elem))
-            w_q(i).mask  := mask_buf
-            w_q(i).addr  := getBankIdx(waddr_buf)
+            w_q(i).data  := Mux(pipe_out.bits.acc, pipe_out_acc_data, pipe_out.bits.data).asTypeOf(Vec(mask_len, mask_elem))
+            w_q(i).mask  := pipe_out.bits.mask
+            w_q(i).addr  := getBankIdx(pipe_out.bits.addr)
           }
         }
 
       }
-      val bank_rdata = mem.read(raddr, ren && !wen).asTypeOf(t)
+      val bank_rdata = read(raddr, ren && !wen).asTypeOf(t)
       when (RegNext(ren && reads(0).valid && isThisBank(reads(0).bits))) {
         acc_rdata := bank_rdata
       } .elsewhen (RegNext(ren)) {
         read_rdata := bank_rdata
       }
       when (wen) {
-        mem.write(waddr, wdata, wmask)
+        write(waddr, wdata, wmask)
       }
       // Three requestors, 1 slot
       // Priority is incoming reads for RMW > writes from RMW > incoming reads
@@ -192,7 +264,7 @@ class AccumulatorMem[T <: Data, U <: Data](
           reads(1).ready := false.B
         }
       } .otherwise {
-        ren := isThisBank(reads(1).bits)
+        ren := isThisBank(reads(1).bits) && reads(1).fire()
         raddr := getBankIdx(reads(1).bits)
       }
     }
@@ -221,19 +293,25 @@ class AccumulatorMem[T <: Data, U <: Data](
   val q_will_be_empty = (q.io.count +& q.io.enq.fire()) - q.io.deq.fire() === 0.U
   io.read.req.ready := q_will_be_empty && (
       // Make sure we aren't accumulating, which would take over both ports
-      !(io.write.fire() && io.write.bits.acc) &&
-      // Make sure we aren't reading something that is still being written
-      !(RegNext(io.write.fire()) && RegNext(io.write.bits.addr) === io.read.req.bits.addr) &&
-      !(w_buf_valid && waddr_buf === io.read.req.bits.addr) &&
+      !io.write.valid &&
       !block_read_req
   )
+  for (r <- pipe_regs) {
+    when (r.valid && r.bits.addr === io.read.req.bits.addr) {
+      io.read.req.ready := false.B
+    }
+  }
 
   // io.write.current_waddr.valid := mem.io.wen
   // io.write.current_waddr.bits := mem.io.waddr
-  io.write.ready := !io.write.bits.acc || (!(io.write.bits.addr === waddr_buf && w_buf_valid) &&
-    !(io.write.bits.addr === RegNext(io.write.bits.addr) && RegNext(io.write.fire())))
+  io.write.ready := true.B
+  for (r <- pipe_regs) {
+    when (r.valid && r.bits.addr === io.write.bits.addr && io.write.bits.acc) {
+      io.write.ready := false.B
+    }
+  }
+
 
   // assert(!(io.read.req.valid && io.write.en && io.write.acc), "reading and accumulating simultaneously is not supported")
   assert(!(io.read.req.fire() && io.write.fire() && io.read.req.bits.addr === io.write.bits.addr), "reading from and writing to same address is not supported")
-  assert(!(io.read.req.fire() && w_buf_valid && waddr_buf === io.read.req.bits.addr), "reading from an address immediately after writing to it is not supported")
 }
